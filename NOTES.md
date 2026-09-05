@@ -75,6 +75,14 @@ This is a design discussion, not something we built. Nothing below was implement
 
 The per-campaign counter locks (`campaignState.mu`) and the campaign-map lock (`campaignsMu`) are *not* what breaks first — those scale fine algorithmically (O(1) map access, contention only within one campaign's own counters) as campaign count grows into the hundreds. The dedup table's single global lock and the total lack of durability are the real bottlenecks.
 
+### What I'd change, and in what order
+
+1. **Durable, uniquely-constrained dedup store first** (e.g. a table with a unique index on `event_id`, or a distributed KV store with conditional-write semantics). This directly replaces the correctness-critical role `reserve()` plays today, and it's what breaks first, so it goes first — everything else can be phased in without it, but nothing is trustworthy without it.
+2. **Move aggregate counters into the same durable store**, partitioned by `campaign_id`. This is what actually fixes "a crash loses everything," and it's a natural pair with step 1 since both are about giving ingestion a real source of truth instead of process memory.
+3. **Introduce the queue** between ingestion and aggregation, once synchronous durable writes start limiting burst throughput. Deliberately sequenced *after* 1–2, not before: a queue adds its own duplicate/idempotency problem (see below), which only has a good answer once the durable dedup store from step 1 exists to backstop it.
+4. **Add the reconciliation job and monitoring** (below) alongside steps 2–3, not as a later afterthought — it's what lets anyone trust the migration itself while it's happening, not just after.
+5. **Only then reconsider the ingestion API's response contract** (fast-ack vs. today's full per-item classification). This is the most externally-visible change (providers would see it), so I'd sequence it last and take it to the PM as an explicit decision, rather than let it be forced quietly by the infrastructure migration.
+
 ### Throughput / concurrency implications
 
 100M/day is ~1,157 events/sec sustained, but real send traffic is bursty — a single large campaign send can itself exceed that for a period. The design needs to absorb bursts, not just sustain an average. This pushes toward: sharding the dedup check across many partitions (e.g. consistent-hash `event_id` into N shards, each independently lockable) instead of one map/mutex, and decoupling "accept the request quickly" from "durably record and aggregate," since doing both synchronously per HTTP request doesn't hold up under bursty load at this volume.
@@ -157,3 +165,30 @@ No — on its own, this is the expected, healthy shape of the funnel. A 1M-messa
 Real campaign behavior explains monotonic increases consistent with normal delayed processing — the `delivered` rise is this. A data/measurement issue is anything that makes a counter that should only ever grow (raw, deduplicated, append-only, as ours is designed) appear to shrink between two reads — since nothing in our own ingestion/aggregation logic retroactively un-counts an already-accepted event, an *observed* decrease is a strong prior toward the read/deployment/definition layer, not the counting logic itself, and that's where I'd look first.
 
 **Ties back to:** timestamp semantics (delayed `delivered` receipts are exactly the "events arrive late" fact from the brief, not an anomaly); provider retries/duplicates (ruled out here since our dedup makes duplicates a non-event for counting, not a source of apparent decreases); aggregation (a race or partial recompute is on the suspect list, just not first); and dashboard freshness/consistency (the most likely non-bug explanation given our own architecture is exactly a consistency or restart issue in the read path, not the count itself).
+
+---
+
+## What I completed / what I intentionally skipped
+
+**Completed:**
+- Part 1 — this notes file, written before any code.
+- Part 2 — the full service: `POST /events` (partial batch acceptance, validation, `event_id`-based dedup with conflict detection, per-campaign concurrency-safe counters) and `GET /campaigns/{id}/stats` (consistent snapshot reads, 404 for never-seen campaigns). Full test suite: unit tests for dedup/conflict/validation, concurrency tests under `-race` (distinct events, same-`event_id`, conflicting payloads, concurrent POST/GET), HTTP-level handler tests, and a regression test replaying the entire `seed/events.json` against independently-computed expected counts.
+- Part 3 — all four debugging bugs found, fixed with minimal diffs, and verified against `expected_output.txt` (including repeated runs and `-race`).
+- Part 4 — the scale memo above.
+- Part 5 — the angry-marketer analysis above.
+- `AI_USAGE.md`.
+
+**Intentionally skipped, and why** (also noted inline above where each decision came up):
+- `GET /campaigns/{id}/events` — explicitly optional in the brief, lowest marginal value for the time box.
+- SQLite or any durable store — explicitly "your choice"; in-memory was the right call for the stated volume and time box, with the tradeoff argued in Part 2 and revisited in Part 4.
+- Causal/funnel validation between event types (e.g. rejecting an `opened` with no prior `delivered`) — would contradict the brief's own stated fact that out-of-order arrival is normal.
+- Any production infrastructure — auth, rate limiting, structured logging/metrics/tracing, graceful shutdown, config files, Docker, deployment — explicitly out of scope per the brief.
+- A generic swappable storage interface — no second backend is actually being built, so an abstraction for one would be premature.
+
+## If I had another day
+
+- Build the optional `GET /campaigns/{id}/events` endpoint — it's the most obviously useful thing left on the table, and the lowest-risk addition given the rest of the design is already in place.
+- Go back to the PM questions in Part 1 and actually get answers, especially on `contact_id` — that's the one required-field call that's an inference rather than a direct reading, and I'd rather have it confirmed than carried as a documented assumption indefinitely.
+- Add the from-raw-events reconciliation job described in Part 4, even at today's small scale — it's cheap to build now and is exactly the kind of thing that would have made the Part 5 scenario a non-event instead of a support ticket.
+- Add a couple of tests I didn't get to: timestamps with unusual-but-valid RFC3339 encodings (non-UTC offsets, leap-second edge cases), and behavior under very large or empty batches.
+- Add minimal structured logging around rejected/conflicting events — right now they're only visible in the `POST /events` response, not anywhere durable, which would matter the moment someone other than the calling provider wants to know why an event was dropped.
